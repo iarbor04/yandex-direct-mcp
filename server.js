@@ -74,6 +74,32 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+/*
+ * Номера объявлений в Директе 19-значные (1234567890123456789), а число в JS точно только до 2^53
+ * (16 цифр). Обычный JSON.parse округляет такие номера: 1234567890123456789 и …790 оба превращаются
+ * в 1234567890123456800, и агент правит не то объявление. Поэтому целые больше 2^53 оборачиваем
+ * в кавычки до разбора и отдаём строками. Директ принимает номера строками и в запросах.
+ * Строки JSON пропускаются целиком, дробные числа и экспонента не трогаются.
+ */
+const JSON_STRING_OR_LONG_INT = /("[^"\\]*(?:\\.[^"\\]*)*")|(?<![\d.eE+-])(-?\d{16,})(?![\d.eE])/g;
+
+function parseJsonKeepingLongInts(text) {
+  return JSON.parse(text.replace(JSON_STRING_OR_LONG_INT, (match, str, int) =>
+    str !== undefined || Number.isSafeInteger(Number(int)) ? match : `"${int}"`));
+}
+
+// Длинный номер, переданный числом, мог быть округлён ещё на стороне MCP-клиента — в Директ его не пускаем.
+function findUnsafeInteger(value, where) {
+  if (typeof value === 'number') return Number.isInteger(value) && !Number.isSafeInteger(value) ? where : null;
+  if (value && typeof value === 'object') {
+    for (const [key, item] of Object.entries(value)) {
+      const hit = findUnsafeInteger(item, Array.isArray(value) ? `${where}[${key}]` : `${where}.${key}`);
+      if (hit) return hit;
+    }
+  }
+  return null;
+}
+
 /* ---------------------------------------------------------------- tools --- */
 
 async function toolStatus() {
@@ -110,7 +136,7 @@ async function callApi(cfg, service, method, params, clientLogin, sandboxOverrid
   const requestId = res.headers.get('requestid');
   const text = await res.text();
   let body;
-  try { body = JSON.parse(text); } catch (_) { body = { raw: text }; }
+  try { body = parseJsonKeepingLongInts(text); } catch (_) { body = { raw: text }; }
   if (body && body.error) {
     const e = body.error;
     throw new Error(
@@ -128,6 +154,14 @@ async function toolCall(args) {
   if (!service || !method) throw new Error('Нужны параметры service и method.');
   if (cfg.readonly && MUTATING.test(method)) {
     throw new Error(`readonly-режим: метод "${method}" заблокирован. Сними YANDEX_DIRECT_READONLY, чтобы менять данные.`);
+  }
+
+  const unsafe = findUnsafeInteger(params, 'params');
+  if (unsafe) {
+    throw new Error(
+      `${unsafe}: число больше 2^53 и могло быть округлено по дороге — запрос не отправлен, чтобы не задеть чужой объект. ` +
+      'Передай длинные номера строками: {"Ids": ["1234567890123456789"]}.'
+    );
   }
   const res = await callApi(cfg, service, method, params, client_login, sandbox);
   const head = `${res.url} :: ${method} :: Units ${res.units || 'n/a'} :: RequestId ${res.requestId || 'n/a'}`;
@@ -194,7 +228,9 @@ set / setAuto (bids, keywordbids), hasSearchVolume (keywordsresearch).
 * campaigns.get      {"SelectionCriteria":{"States":["ON"]},"FieldNames":["Id","Name","State","Status","DailyBudget"],"TextCampaignFieldNames":["BiddingStrategy"]}
 * campaigns.suspend  {"SelectionCriteria":{"Ids":[123456]}}
 * adgroups.get       {"SelectionCriteria":{"CampaignIds":[123456]},"FieldNames":["Id","Name","CampaignId","Status"]}
-* ads.get            {"SelectionCriteria":{"CampaignIds":[123456]},"FieldNames":["Id","AdGroupId","State","Status"],"TextAdFieldNames":["Title","Title2","Text","Href"]}
+* ads.get            {"SelectionCriteria":{"CampaignIds":[123456]},"FieldNames":["Id","AdGroupId","Type","State","Status"],"TextAdFieldNames":["Title","Title2","Text","Href"],"ResponsiveAdFieldNames":["Titles","Texts","Href"]}
+* ads.get по номерам {"SelectionCriteria":{"Ids":["1234567890123456789"]},"FieldNames":["Id","AdGroupId","Type"]}   // номера объявлений — строками
+* ads.add            {"Ads":[{"AdGroupId":111,"ResponsiveAd":{"Titles":["Заголовок 1","Заголовок 2"],"Texts":["Текст 1","Текст 2"],"Href":"https://example.com"}}]}
 * keywords.get       {"SelectionCriteria":{"CampaignIds":[123456]},"FieldNames":["Id","Keyword","Bid","State","Status","StatisticsSearch"]}
 * keywords.add       {"Keywords":[{"AdGroupId":111,"Keyword":"купить кроссовки nike","Bid":30000000}]}
 * bids.set           {"Bids":[{"KeywordId":222,"Bid":25000000}]}          // ставки в микроединицах: 25 000 000 = 25 руб.
@@ -210,6 +246,20 @@ AD_PERFORMANCE_REPORT, CRITERIA_PERFORMANCE_REPORT, SEARCH_QUERY_PERFORMANCE_REP
 CUSTOM_REPORT, REACH_AND_FREQUENCY_PERFORMANCE_REPORT.
 ReportName должен быть уникальным. Cost приходит в валюте (returnMoneyInMicros=false).
 
+Длинные номера: Id объявлений — 19 цифр, это больше точности чисел JSON в JS (2^53). В ответах сервер
+отдаёт такие номера строками ("Id": "1234567890123456789"), в params передавай их тоже строками — Директ
+их принимает. Длинный номер, переданный числом, сервер отклонит: по дороге он мог округлиться в чужой.
+
+Объявления: текстовые объявления теперь комбинаторные (Type RESPONSIVE_AD) — структура ResponsiveAd
+в add/update, ResponsiveAdFieldNames в get. Titles — от 1 до 7 заголовков (до 56 символов),
+Texts — от 1 до 3 текстов (до 81 символа), в группе до 3 неархивных комбинаторных объявлений.
+* TextAd в ads.add создаёт комбинаторное объявление с одним заголовком и одним текстом
+  (Title2 приклеивается к Title через «. » или теряется). Для нескольких заголовков — ResponsiveAd.
+* ads.update с TextAd по комбинаторному объявлению оставит в нём один заголовок и один текст —
+  править только через ResponsiveAd.
+* ads.get без ResponsiveAdFieldNames показывает комбинаторные объявления как TEXT_AD
+  с первым заголовком и текстом.
+
 Лимиты: ответ get отдаёт максимум 10 000 объектов — листай через LimitOffset {"Limit":10000,"Offset":N}.
 Каждый вызов тратит баллы (Units) — они в заголовке ответа и печатаются в выводе.`;
 
@@ -223,13 +273,13 @@ const TOOLS = [
   {
     name: 'direct_call',
     description:
-      'Универсальный вызов Яндекс Директ API v5: POST на /json/v5/{service} с телом {method, params}. Покрывает всё управление: кампании, группы, объявления, ключевые фразы, ставки, ретаргетинг, справочники. Сначала загляни в direct_reference за именами сервисов, методов и формой params.',
+      'Универсальный вызов Яндекс Директ API v5: POST на /json/v5/{service} с телом {method, params}. Покрывает всё управление: кампании, группы, объявления, ключевые фразы, ставки, ретаргетинг, справочники. Сначала загляни в direct_reference за именами сервисов, методов и формой params. Номера объявлений (19 цифр) приходят и передаются строками: число больше 2^53 по дороге округлится.',
     inputSchema: {
       type: 'object',
       properties: {
         service: { type: 'string', description: 'Сервис API v5, например campaigns, adgroups, ads, keywords, bids, dictionaries.' },
         method: { type: 'string', description: 'Метод сервиса: get, add, update, delete, suspend, resume, archive, moderate, set, setAuto.' },
-        params: { type: 'object', description: 'Объект params запроса (SelectionCriteria, FieldNames, массивы объектов и т.д.).' },
+        params: { type: 'object', description: 'Объект params запроса (SelectionCriteria, FieldNames, массивы объектов и т.д.). Длинные номера (Id объявлений) — строками: {"Ids": ["1234567890123456789"]}.' },
         client_login: { type: 'string', description: 'Логин клиента для агентского аккаунта (заголовок Client-Login). По умолчанию берётся из конфига.' },
         sandbox: { type: 'boolean', description: 'true — бить в песочницу, false — в боевой API. По умолчанию из конфига.' },
       },
