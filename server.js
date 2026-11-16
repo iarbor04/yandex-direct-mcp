@@ -6,9 +6,10 @@
  * Zero dependencies: raw JSON-RPC over newline-delimited stdio, global fetch (Node >= 18).
  *
  * Credentials (re-read on every call, so a token can be added without restarting):
- *   ~/.config/yandex-direct/config.json  {"token": "...", "client_login": "...", "sandbox": false}
+ *   ~/.config/yandex-direct/config.json  {"token": "...", "client_login": "...", "sandbox": false, "api_version": "v5"}
  *   ~/.config/yandex-direct/token        (plain token, fallback)
  *   env YANDEX_DIRECT_TOKEN / YANDEX_DIRECT_CLIENT_LOGIN / YANDEX_DIRECT_SANDBOX / YANDEX_DIRECT_READONLY
+ *       / YANDEX_DIRECT_API_VERSION
  */
 
 const fs = require('fs');
@@ -18,8 +19,16 @@ const path = require('path');
 const SERVER_NAME = 'yandex-direct';
 const SERVER_VERSION = '0.1.0';
 
-const PROD_BASE = 'https://api.direct.yandex.com/json/v5/';
-const SANDBOX_BASE = 'https://api-sandbox.direct.yandex.com/json/v5/';
+// Версия API добавляется к базовому адресу: .../json/v5/{service} или .../json/v501/{service}.
+const PROD_BASE = 'https://api.direct.yandex.com/json/';
+const SANDBOX_BASE = 'https://api-sandbox.direct.yandex.com/json/';
+
+// v501 — версия API, в которой работают новые типы объектов (например, ResponsiveAd в ads.add / ads.update).
+const API_VERSIONS = ['v5', 'v501'];
+const DEFAULT_API_VERSION = 'v5';
+
+// Имя сервиса подставляется в URL, поэтому только латиница и цифры: "../v501/ads" и прочие пути не пройдут.
+const SERVICE_NAME = /^[a-z0-9]+$/;
 
 const CONFIG_DIR =
   process.env.YANDEX_DIRECT_CONFIG_DIR || path.join(os.homedir(), '.config', 'yandex-direct');
@@ -52,11 +61,35 @@ function loadConfig() {
   if (process.env.YANDEX_DIRECT_CLIENT_LOGIN) cfg.client_login = process.env.YANDEX_DIRECT_CLIENT_LOGIN;
   if (process.env.YANDEX_DIRECT_SANDBOX) cfg.sandbox = truthy(process.env.YANDEX_DIRECT_SANDBOX);
   if (process.env.YANDEX_DIRECT_READONLY) cfg.readonly = truthy(process.env.YANDEX_DIRECT_READONLY);
+  if (process.env.YANDEX_DIRECT_API_VERSION) cfg.api_version = process.env.YANDEX_DIRECT_API_VERSION;
   return cfg;
 }
 
-function baseUrl(sandbox) {
-  return sandbox ? SANDBOX_BASE : PROD_BASE;
+// Версия API: параметр инструмента -> YANDEX_DIRECT_API_VERSION -> api_version в config.json -> v5.
+function apiVersion(cfg, override) {
+  const raw = override !== undefined && override !== null && override !== '' ? override : cfg.api_version;
+  const version = raw === undefined || raw === null || raw === '' ? DEFAULT_API_VERSION : String(raw).trim().toLowerCase();
+  if (!API_VERSIONS.includes(version)) {
+    throw new Error(
+      `Неизвестная версия API "${raw}": допустимы ${API_VERSIONS.join(', ')} ` +
+      '(параметр api_version, переменная YANDEX_DIRECT_API_VERSION или поле api_version в config.json).'
+    );
+  }
+  return version;
+}
+
+function baseUrl(sandbox, version) {
+  return (sandbox ? SANDBOX_BASE : PROD_BASE) + (version || DEFAULT_API_VERSION) + '/';
+}
+
+function serviceUrl(sandbox, version, service) {
+  if (typeof service !== 'string' || !SERVICE_NAME.test(service)) {
+    throw new Error(
+      `Недопустимое имя сервиса ${JSON.stringify(service)}: нужно имя из списка (${SERVICES.join(', ')}) — ` +
+      'строчные латинские буквы и цифры, без "/" и "..". Версия API задаётся не в service, а параметром api_version: "v5" или "v501".'
+    );
+  }
+  return baseUrl(sandbox, version) + service;
 }
 
 function authHeaders(cfg, clientLogin) {
@@ -78,11 +111,23 @@ function sleep(ms) {
 
 async function toolStatus() {
   const cfg = loadConfig();
+  let version = DEFAULT_API_VERSION;
+  let versionLine;
+  try {
+    version = apiVersion(cfg);
+    const source = process.env.YANDEX_DIRECT_API_VERSION
+      ? 'env YANDEX_DIRECT_API_VERSION'
+      : cfg.api_version ? 'config.json' : 'по умолчанию';
+    versionLine = `${version} (${source}; в direct_call / direct_report меняется параметром api_version)`;
+  } catch (e) {
+    versionLine = `ОШИБКА — ${e.message}`;
+  }
   const lines = [
     `token: ${cfg.token ? `загружен (${cfg.token.length} симв., ...${cfg.token.slice(-4)})` : 'НЕ НАЙДЕН'}`,
     `источник: ${process.env.YANDEX_DIRECT_TOKEN ? 'env YANDEX_DIRECT_TOKEN' : `${CONFIG_FILE} / ${TOKEN_FILE}`}`,
     `client_login: ${cfg.client_login || '(не задан — работаем от владельца токена)'}`,
-    `среда: ${cfg.sandbox ? 'ПЕСОЧНИЦА ' + SANDBOX_BASE : 'БОЕВАЯ ' + PROD_BASE}`,
+    `среда: ${cfg.sandbox ? 'ПЕСОЧНИЦА ' : 'БОЕВАЯ '}${baseUrl(cfg.sandbox, version)}`,
+    `версия API: ${versionLine}`,
     `readonly: ${cfg.readonly ? 'ДА (мутирующие методы заблокированы)' : 'нет (доступны add/update/delete)'}`,
   ];
   if (!cfg.token) {
@@ -98,9 +143,9 @@ async function toolStatus() {
   return lines.join('\n');
 }
 
-async function callApi(cfg, service, method, params, clientLogin, sandboxOverride) {
+async function callApi(cfg, service, method, params, clientLogin, sandboxOverride, versionOverride) {
   const sandbox = sandboxOverride === undefined || sandboxOverride === null ? cfg.sandbox : sandboxOverride;
-  const url = baseUrl(sandbox) + service;
+  const url = serviceUrl(sandbox, apiVersion(cfg, versionOverride), service);
   const res = await fetch(url, {
     method: 'POST',
     headers: authHeaders(cfg, clientLogin),
@@ -124,12 +169,12 @@ async function callApi(cfg, service, method, params, clientLogin, sandboxOverrid
 async function toolCall(args) {
   const cfg = loadConfig();
   if (!cfg.token) throw new Error(`Нет OAuth-токена. Положи его в ${TOKEN_FILE} и повтори.`);
-  const { service, method, params, client_login, sandbox } = args;
+  const { service, method, params, client_login, sandbox, api_version } = args;
   if (!service || !method) throw new Error('Нужны параметры service и method.');
   if (cfg.readonly && MUTATING.test(method)) {
     throw new Error(`readonly-режим: метод "${method}" заблокирован. Сними YANDEX_DIRECT_READONLY, чтобы менять данные.`);
   }
-  const res = await callApi(cfg, service, method, params, client_login, sandbox);
+  const res = await callApi(cfg, service, method, params, client_login, sandbox, api_version);
   const head = `${res.url} :: ${method} :: Units ${res.units || 'n/a'} :: RequestId ${res.requestId || 'n/a'}`;
   return `${head}\n\n${JSON.stringify(res.body.result !== undefined ? res.body.result : res.body, null, 2)}`;
 }
@@ -140,7 +185,7 @@ async function toolReport(args) {
   const params = args.params;
   if (!params) throw new Error('Нужен объект params (ReportDefinition).');
   const sandbox = args.sandbox === undefined || args.sandbox === null ? cfg.sandbox : args.sandbox;
-  const url = baseUrl(sandbox) + 'reports';
+  const url = serviceUrl(sandbox, apiVersion(cfg, args.api_version), 'reports');
   const headers = Object.assign(authHeaders(cfg, args.client_login), {
     processingMode: args.processing_mode || 'auto',
     returnMoneyInMicros: 'false',
@@ -182,8 +227,16 @@ async function toolReport(args) {
 
 const REFERENCE = `Яндекс Директ API v5 — шпаргалка для direct_call.
 
-Базовые URL: боевой ${PROD_BASE} | песочница ${SANDBOX_BASE}
+Базовые URL: боевой ${PROD_BASE}<версия>/ | песочница ${SANDBOX_BASE}<версия>/
 Тело запроса собирается сервером: {"method": <method>, "params": <params>}
+
+Версия API: ${API_VERSIONS.join(' или ')}. По умолчанию — из YANDEX_DIRECT_API_VERSION или api_version в config.json,
+иначе ${DEFAULT_API_VERSION}; для одного вызова — параметр api_version у direct_call и direct_report.
+В service — только имя сервиса (ads, campaigns…), без версии и "/".
+* ResponsiveAd (объявление с несколькими заголовками и текстами) в ads.add / ads.update работает только
+  в v501, в v5 Директ отвечает ошибкой 3500. Пример: direct_call service "ads", method "add", api_version "v501",
+  params {"Ads":[{"AdGroupId":111,"ResponsiveAd":{"Titles":["Заголовок 1","Заголовок 2"],"Texts":["Текст 1","Текст 2"],"Href":"https://example.com"}}]}
+* В ads.update уточнения меняются через CalloutSetting, а не AdExtensionIds.
 
 Сервисы: ${SERVICES.join(', ')}
 
@@ -217,7 +270,7 @@ const TOOLS = [
   {
     name: 'direct_status',
     description:
-      'Проверить подключение к Яндекс Директу: найден ли токен, какая среда (боевая/песочница), доступен ли API (пробный clients.get) и сколько осталось баллов. Токен не раскрывается.',
+      'Проверить подключение к Яндекс Директу: найден ли токен, какая среда (боевая/песочница) и версия API по умолчанию, доступен ли API (пробный clients.get) и сколько осталось баллов. Токен не раскрывается.',
     inputSchema: { type: 'object', properties: {}, additionalProperties: false },
   },
   {
@@ -232,6 +285,7 @@ const TOOLS = [
         params: { type: 'object', description: 'Объект params запроса (SelectionCriteria, FieldNames, массивы объектов и т.д.).' },
         client_login: { type: 'string', description: 'Логин клиента для агентского аккаунта (заголовок Client-Login). По умолчанию берётся из конфига.' },
         sandbox: { type: 'boolean', description: 'true — бить в песочницу, false — в боевой API. По умолчанию из конфига.' },
+        api_version: { type: 'string', enum: API_VERSIONS, description: 'Версия API в адресе /json/{версия}/{service}: v5 или v501 (v501 нужна, например, для ResponsiveAd в ads.add / ads.update). По умолчанию из конфига, иначе v5.' },
       },
       required: ['service', 'method'],
       additionalProperties: false,
@@ -247,6 +301,7 @@ const TOOLS = [
         params: { type: 'object', description: 'ReportDefinition: SelectionCriteria, FieldNames, ReportName (уникальное), ReportType, DateRangeType, Format: TSV, IncludeVAT, IncludeDiscount.' },
         client_login: { type: 'string', description: 'Логин клиента для агентского аккаунта.' },
         sandbox: { type: 'boolean', description: 'Песочница вместо боевого API.' },
+        api_version: { type: 'string', enum: API_VERSIONS, description: 'Версия API: v5 или v501. По умолчанию из конфига, иначе v5.' },
         processing_mode: { type: 'string', enum: ['auto', 'online', 'offline'], description: 'Режим формирования отчёта, по умолчанию auto.' },
         wait_seconds: { type: 'number', description: 'Сколько секунд ждать готовности отчёта, по умолчанию 180.' },
       },
