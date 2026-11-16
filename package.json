@@ -5,7 +5,8 @@
   "main": "server.js",
   "bin": { "yandex-direct-mcp": "server.js" },
   "scripts": {
-    "check": "node --check server.js && bash -n save-token.sh"
+    "check": "node --check server.js && bash -n save-token.sh",
+    "test": "node --test test/api-version.test.js"
   },
   "engines": { "node": ">=18" },
   "keywords": ["mcp", "model-context-protocol", "yandex", "yandex-direct", "ads", "ppc", "claude"],

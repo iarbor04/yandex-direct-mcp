@@ -108,6 +108,7 @@ printf '%s\n' \
 | `error 53` — «Недействительный OAuth-токен» | Токен отозван, истёк или скопирован с обрезкой | Получить заново через `./save-token.sh` |
 | `clients.get` отвечает, но `campaigns.get` возвращает пустой список | Токен выдан под логином, в котором нет кампаний | Получить токен под нужным логином. Повторная заявка не нужна: она одобрена на приложение, а не на пользователя |
 | Заявку требуется подать повторно после пересоздания приложения | Одобрение привязано к Client ID, а не к аккаунту | Не удалять одобренное приложение. Если удалил — новая заявка, в описании сослаться на прежний Client ID |
+| `error 3500` — «Объявление данного типа не поддерживается в v5, используйте v501» | `ResponsiveAd` в `ads.add` / `ads.update` работает только в версии API v501 | Передать `api_version: "v501"` в `direct_call` или переключить версию по умолчанию — см. [«Версия API»](#версия-api) |
 
 Отдельно: **токен нельзя вставлять в чат агента** — он осядет в истории переписки. Для этого и сделан `save-token.sh` со скрытым вводом. Если всё же вставил — отзови доступ на [id.yandex.ru/personal/data-access](https://id.yandex.ru/personal/data-access) и получи новый.
 
@@ -115,9 +116,9 @@ printf '%s\n' \
 
 | Инструмент | Назначение |
 |---|---|
-| `direct_status` | Есть ли токен, какая среда, живой ли доступ (пробный `clients.get`), остаток баллов. Токен не раскрывается |
+| `direct_status` | Есть ли токен, какая среда и версия API, живой ли доступ (пробный `clients.get`), остаток баллов. Токен не раскрывается |
 | `direct_reference` | Шпаргалка: сервисы, методы, примеры `params`, типы отчётов, единицы ставок, лимиты |
-| `direct_call` | Универсальный вызов `POST /json/v5/{service}` с телом `{method, params}` |
+| `direct_call` | Универсальный вызов `POST /json/{v5\|v501}/{service}` с телом `{method, params}` |
 | `direct_report` | Reports API: отправляет ReportDefinition, дожидается готовности (коды 201/202), возвращает TSV |
 
 ## Конфигурация
@@ -129,7 +130,8 @@ printf '%s\n' \
   "token": "",
   "client_id": "…",
   "client_login": "",
-  "sandbox": false
+  "sandbox": false,
+  "api_version": "v5"
 }
 ```
 
@@ -141,9 +143,38 @@ printf '%s\n' \
 | `YANDEX_DIRECT_CLIENT_LOGIN` | Логин клиента для агентского аккаунта (заголовок `Client-Login`) |
 | `YANDEX_DIRECT_SANDBOX=1` | Работать с песочницей |
 | `YANDEX_DIRECT_READONLY=1` | Блокировать `add`, `update`, `delete`, `suspend`, `resume`, `moderate`, `set` |
+| `YANDEX_DIRECT_API_VERSION` | Версия API по умолчанию: `v5` или `v501`, приоритетнее `api_version` в `config.json` |
 | `YANDEX_DIRECT_CONFIG_DIR` | Другой каталог конфигурации |
 
 Порядок поиска токена: `YANDEX_DIRECT_TOKEN` → `config.json` → `~/.config/yandex-direct/token`.
+
+### Версия API
+
+Запросы уходят на `https://api.direct.yandex.com/json/<версия>/<сервис>` (в песочнице — `api-sandbox.direct.yandex.com`). Поддерживаются версии `v5` и `v501`. Версия выбирается так:
+
+1. параметр `api_version` у `direct_call` или `direct_report` — для одного вызова;
+2. переменная окружения `YANDEX_DIRECT_API_VERSION`;
+3. поле `api_version` в `config.json`;
+4. иначе `v5` — поведение по умолчанию прежнее.
+
+Действующую версию по умолчанию показывает `direct_status`.
+
+`ResponsiveAd` — объявление с несколькими заголовками и текстами — в `ads.add` и `ads.update` работает только в `v501`; в `v5` Директ отвечает ошибкой 3500. Пример вызова `direct_call`:
+
+```json
+{
+  "service": "ads",
+  "method": "add",
+  "api_version": "v501",
+  "params": {"Ads":[{"AdGroupId":111,"ResponsiveAd":{"Titles":["Заголовок 1","Заголовок 2"],"Texts":["Текст 1","Текст 2"],"Href":"https://example.com"}}]}
+}
+```
+
+В `ads.update` уточнения меняются через `CalloutSetting`, а не `AdExtensionIds`.
+
+В `service` передаётся только имя сервиса (`ads`, `campaigns`, `reports`…): сервер принимает строчные латинские буквы и цифры и отклоняет пути вроде `../v501/ads`. Версию нужно задавать через `api_version`.
+
+Выбор версии и проверку имени сервиса можно проверить без обращения к API: `npm test` (встроенный `node:test`, зависимостей не нужно).
 
 ## Лимиты и стоимость
 
